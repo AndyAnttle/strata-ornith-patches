@@ -1,0 +1,142 @@
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -1335,6 +1335,7 @@
+     };
+     std::vector<Hy> hy;
+     int hybrid_t = 32;
++    size_t boot_others = 0;   // VRAM held by other programs when this process started (0: a dedicated card)
+     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
+     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
+     /// state index li's layer runs hybrid (its experts not all in VRAM)
+@@ -2999,6 +3000,65 @@
+ };
+ 
+ // ------------------------------------------------------------------------------------------------ expert placement
++/// Is another program driving a display on this card?  Windows keeps the desktop's composition surfaces there even
++/// when nothing looks busy, and nvidia-smi lists those processes as "C+G"; the CUDA free-memory reading alone cannot
++/// tell such a card from a dedicated one (measured: a 12 GB card that drove its display reported 1.1 GiB in use at
++/// start, because the desktop itself holds little until a window is opened).  NVML is loaded at run time so the build
++/// needs no new library; a machine without it answers false and the caller falls back to the free-memory reading.
++static bool card_has_display_processes() {
++#if defined(_WIN32)
++    HMODULE lib = LoadLibraryA("nvml.dll");
++#else
++    void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
++#endif
++    if (lib == nullptr) return false;
++    using Init = int (*)();
++    using Shutdown = int (*)();
++    using ByPci = int (*)(const char*, void**);
++    using Graphics = int (*)(void*, void**, unsigned int*);
++    using Count = int (*)(void*, unsigned int*);
++#if defined(_WIN32)
++#define Q36_SYM(x) GetProcAddress(lib, x)
++#else
++#define Q36_SYM(x) dlsym(lib, x)
++#endif
++    auto init = (Init) Q36_SYM("nvmlInit_v2");
++    auto fini = (Shutdown) Q36_SYM("nvmlShutdown");
++    auto by_pci = (ByPci) Q36_SYM("nvmlDeviceGetHandleByPciBusId_v2");
++    auto graphics = (Graphics) Q36_SYM("nvmlDeviceGetGraphicsRunningProcesses_v2");
++    auto count = (Count) Q36_SYM("nvmlDeviceGetGraphicsRunningProcessesCount_v2");
++    char pci[64] = {};
++    bool has = false;
++    if (init && fini && by_pci && (graphics || count) && cudaDeviceGetPCIBusId(pci, sizeof pci, 0) == cudaSuccess) {
++        if (init() == 0) {
++            void* dev = nullptr;
++            if (by_pci(pci, &dev) == 0 && dev != nullptr) {
++                // Ask for the count with an empty buffer: NVML answers 0 and leaves the value alone when there is
++                // none, and INSUFFICIENT_SIZE (8) with the real count when there are some (measured: a compute 3090
++                // returned 0 while the caller's 32 stayed, which read as "32 display processes").
++                if (count) {
++                    unsigned int n = 0;
++                    const int rc = count(dev, &n);
++                    if ((rc == 0 || rc == 8) && n > 0) has = true;
++                } else {
++                    unsigned int n = 0;
++                    const int rc = graphics(dev, nullptr, &n);
++                    if ((rc == 0 || rc == 8) && n > 0) has = true;
++                }
++            }
++            (void) fini();
++        }
++    }
++#undef Q36_SYM
++#if defined(_WIN32)
++    FreeLibrary(lib);
++#else
++    dlclose(lib);
++#endif
++    return has;
++}
++
++
+ /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
+ /// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
+ /// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
+@@ -3023,8 +3083,12 @@
+     // Measured on a 12 GB card driving its display (8 GB prompt, one RTX 3060): a 768 MiB reserve filled 11.98 of
+     // 12 GB and decoded at 4.4 tok/s; the same run with ~2.4 GiB left free decoded at 33.4.  So the reserve is a
+     // fifth of the card, kept between 768 MiB and 2.5 GiB (a 24 GB card leaves 2.5 GiB, a 12 GB card 2.4 GiB).
+-    const size_t reserve = std::min<size_t>((size_t) 2560 << 20,
+-                                            std::max<size_t>((size_t) 768 << 20, tot / 5));
++    // A dedicated card (nothing else on it when the engine started) can be filled down to a flat reserve; a shared
++    // one keeps a fifth of the card, capped at 2.5 GiB, because whatever else is on it grows after this placement.
++    const bool shared_card = E.boot_others > 0;
++    const size_t reserve = shared_card ? std::min<size_t>((size_t) 2560 << 20,
++                                                          std::max<size_t>((size_t) 768 << 20, tot / 5))
++                                       : (size_t) 768 << 20;
+     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
+                                         : (fr > reserve ? fr - reserve : 0);
+     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
+@@ -3061,7 +3125,8 @@
+     size_t total_main = 0;
+     for (Layer& L : m.layers) total_main += L.stride * (size_t) ne + kMmqTail;
+     bool mtp_only = false;
+-    if (slots <= 0 && vram_gib < 0 && m.has_mtp && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
++    if (slots <= 0 && vram_gib < 0 && m.has_mtp && !shared_card && total > budget2 &&
++        std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
+         const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // att_s (4 B) + att_p16 (2 B)
+         const size_t small_reserve = (size_t) 256 << 20;
+         const size_t room = fr + att_save > small_reserve ? fr + att_save - small_reserve : 0;
+@@ -4029,6 +4094,32 @@
+ #endif
+     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
+     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
++    // What other programs hold on this card, read before this process allocates anything: the placement has to know
++    // whether the card is shared (a desktop, a browser, another job) or dedicated.  A dedicated card can be filled down
++    // to its own reserve; a shared one must keep real room, because Windows moves the model into shared memory the
++    // moment something else needs VRAM and the decode then crawls.  The threshold covers the CUDA context and the
++    // vision encoder, which also sits on this card: STRATA_Q36_SHARED_MIB overrides it.
++    size_t boot_others = 0;
++    {
++        size_t boot_fr = 0, boot_tot = 0;
++        (void) cudaMemGetInfo(&boot_fr, &boot_tot);
++        const size_t used = boot_tot > boot_fr ? boot_tot - boot_fr : 0;
++        const char* v = std::getenv("STRATA_Q36_SHARED_MIB");
++        const size_t threshold = (size_t) (v != nullptr ? std::atoi(v) : 2560) << 20;
++        // Two signals: memory already taken (another job), and a display driving this card.  The second one matters
++        // because a desktop that is idle at this moment holds little and looks like a free card, then grows the moment
++        // a window opens - measured on a 12 GB card: 1.1 GiB at start, 11.98 GiB and shared-memory spill minutes later.
++        // The installer sets STRATA_Q36_SHARED=1 when the chosen card drives the display: Windows will not tell a
++        // process which adapter does (NVML answers ERROR_NOT_SUPPORTED for the graphics-process list on WDDM).
++        const char* forced = std::getenv("STRATA_Q36_SHARED");
++        const bool display = card_has_display_processes() ||
++                             (forced != nullptr && forced[0] != '0' && forced[0] != '\0');
++        boot_others = (used > threshold || display) ? (used > 0 ? used : 1) : 0;
++        std::fprintf(stderr, "strata-q36: %.2f GiB of %.2f GiB was in use on this card before the model%s: %s\n",
++                     (double) used / (1 << 30), (double) boot_tot / (1 << 30),
++                     display ? ", and a display drives it" : "",
++                     boot_others ? "a shared card, the placement keeps room" : "a dedicated card");
++    }
+     Model m;
+     std::string err;
+     try {
+@@ -4038,6 +4129,7 @@
+         return 1;
+     }
+     Engine E;
++    E.boot_others = boot_others;
+     E.use_graph = graph;
+     E.kv8 = kv8;
+     E.kv_f16 = kv_f16;

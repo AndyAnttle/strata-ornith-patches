@@ -1,0 +1,60 @@
+--- a/include/strata/kernels/cpu/native_expert.hpp
++++ b/include/strata/kernels/cpu/native_expert.hpp
+@@ -15,8 +15,9 @@
+ 
+ /// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
+ inline constexpr size_t kNativeActBytes = 4096;
+-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
+-inline constexpr size_t kNativeHBytes = 1024;
++/// Bytes of the largest quantized down activation (1280 values as Q8_0: 40 x 34; the qwen35moe family's n_ff 1024,
++/// whose Q8_0 row is 1088 B and Q8_K row 1168 B).
++inline constexpr size_t kNativeHBytes = 2048;
+ 
+ /// Arithmetic fixed for one pool batch. WindowInvariant preserves the legacy singleton result at every width.
+ enum class NativeArithmetic { Default, WindowInvariant };
+--- a/include/strata/kernels/cpu/pool.hpp
++++ b/include/strata/kernels/cpu/pool.hpp
+@@ -250,6 +250,9 @@
+     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
+                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
+     static constexpr int kMaxSplitMulti = 96;
++    /// The widest expert hidden a multi-token phase may hold: Flash-Next's FF 640, Qwen3.6's 512 and the qwen35moe
++    /// family's 1024 (the native path writes n_ff values per token here, not the packed FF).
++    static constexpr int kSplitMultiFF = 1024;
+     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
+     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
+     int64_t multi_bytes = 0;
+@@ -362,7 +365,7 @@
+     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
+     int mtasks_ = 1;        // equal row ranges the phase is cut into
+     struct SplitBufMulti {
+-        alignas(64) float ff[MAXT][FF];
++        alignas(64) float ff[MAXT][kSplitMultiFF];
+         ActQ a2[MAXT];
+         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
+     };
+--- a/src/kernels/cpu/pool.cpp
++++ b/src/kernels/cpu/pool.cpp
+@@ -1378,7 +1378,7 @@
+         const auto b = std::chrono::steady_clock::now();
+         for (int e = 0; e < nb; ++e)
+             for (int t = 0; t < mjobs_[e].nt; ++t)
+-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
++                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], (int) f.n_ff, split_multi_[(size_t) e].a2[t]);
+                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+         const auto c = std::chrono::steady_clock::now();
+         mrows_ = (int64_t) nb * f.n_embd;
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -847,9 +847,9 @@
+ #endif
+ // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
+ #ifdef STRATA_Q6K_EXPERTS
+-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
++#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(12) X(13) X(14) X(16) X(17) X(18) X(21) X(22) X(40) X(144) X(146) X(147) X(148) X(149)
+ #else
+-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
++#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(12) X(13) X(16) X(17) X(18) X(21) X(22) X(40) X(144) X(146) X(147) X(148) X(149)
+ #endif
+ #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
+ template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values

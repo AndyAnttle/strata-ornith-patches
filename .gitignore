@@ -1,0 +1,7 @@
+build*/
+*.zip
+src*/
+stage*/
+test*/
+pristine*/
+COMMIT-MSG.txt

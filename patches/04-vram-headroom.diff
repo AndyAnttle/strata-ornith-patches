@@ -1,0 +1,37 @@
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -2972,6 +2972,18 @@
+         reset();
+         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
+                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
++        // A placement that leaves nothing free looks fine here and runs several times slower in use: Windows moves
++        // part of the model to shared memory the moment anything else needs VRAM, and every token then streams over
++        // PCIe.  Say it now rather than let the user wonder why the card reads 100% and the words crawl.
++        size_t wfr = 0, wtot = 0;
++        CK(cudaMemGetInfo(&wfr, &wtot));
++        // Only the hybrid mode: the all-in-VRAM path deliberately runs with a 256 MiB reserve (the attention
++        // buffer shrunk to seat every expert) and is fast exactly because nothing streams.
++        if (main_hybrid && wfr < ((size_t) 512 << 20))
++            std::fprintf(stderr, "strata-q36: only %llu MiB of VRAM is free after the warmup. The card is full: the "
++                         "desktop or another program that needs VRAM will push part of the model into shared memory, and "
++                         "the decode becomes several times slower. Use a shorter --max-context, or --expert-vram GiB to "
++                         "leave the card some room.\n", (unsigned long long) (wfr >> 20));
+     }
+ 
+     int greedy() {
+@@ -3005,7 +3017,14 @@
+     }
+     size_t fr = 0, tot = 0;
+     CK(cudaMemGetInfo(&fr, &tot));
+-    const size_t reserve = (size_t) 768 << 20;
++    // The reserve is what stays free after the placement.  A card that also drives the desktop, or that hosts the
++    // vision encoder, grows afterwards: Windows does not refuse an allocation it cannot fit, it moves part of the
++    // model to shared memory, and decode then runs over PCIe at a fraction of the speed while the card reads 100%.
++    // Measured on a 12 GB card driving its display (8 GB prompt, one RTX 3060): a 768 MiB reserve filled 11.98 of
++    // 12 GB and decoded at 4.4 tok/s; the same run with ~2.4 GiB left free decoded at 33.4.  So the reserve is a
++    // fifth of the card, kept between 768 MiB and 2.5 GiB (a 24 GB card leaves 2.5 GiB, a 12 GB card 2.4 GiB).
++    const size_t reserve = std::min<size_t>((size_t) 2560 << 20,
++                                            std::max<size_t>((size_t) 768 << 20, tot / 5));
+     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
+                                         : (fr > reserve ? fr - reserve : 0);
+     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
