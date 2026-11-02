@@ -66,15 +66,16 @@ If you do not have that file, there are two ways to get a working head:
    writes.
 
 2. **Download one:** [SizorCloud/Ornith-1.5-35B-A3B-MTP](https://huggingface.co/SizorCloud/Ornith-1.5-35B-A3B-MTP)
-   holds a head derived from Qwen3.6-35B-A3B.
+   holds two, both measured below: `mtp-Ornith-1.5-35B-A3B-Q4_K_M-extracted.gguf` (the block taken out of
+   Ornith-1.5-35B-Q4_K_M) and `mtp-Qwen3.6-35B-A3B-Q8_0.gguf` (taken from Qwen3.6-35B-A3B).
 
 Measured on `Ornith-1.5-35B-A3B-AD-Q6_K.gguf`, RTX 3090, 2,739-token prompt, 120 generated:
 
 | head | decode | drafts |
 |---|---|---|
 | none (`--mtp 0`) | 49.7 tok/s | 0 |
-| derived from Qwen3.6-35B-A3B | 58.3 tok/s | 65 of 110 (59%) |
-| extracted from Ornith-1.5-35B-Q4_K_M | **67.9 tok/s** | **79 of 84 (94%)** |
+| `mtp-Qwen3.6-35B-A3B-Q8_0.gguf` (HF) | 58.3 tok/s | 65 of 110 (59%) |
+| `mtp-Ornith-1.5-35B-A3B-Q4_K_M-extracted.gguf` (HF), or the same block made locally with `tools/extract_mtp.py` | **67.9 tok/s** | **79 of 84 (94%)** |
 
 The head from the same model family stays closest.
 
