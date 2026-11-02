@@ -48,22 +48,38 @@ Three interleaved runs against the previous engine (built on the pre-release 0.1
 
 ## Files without an MTP block
 
-UD and `-AD-` repacks of Ornith-1.5 35B carry no `nextn_predict_layers`, and `strata-q36` refuses them with
-`missing qwen35moe.nextn_predict_layers` even without `--mtp`. The trained head is inside the official
-`Ornith-1.5-35B-Q4_K_M.gguf` as the `blk.40.*` block: 20 tensors, a full layer plus the `nextn.*` projections,
-558 MB. Extract it into its own GGUF and pass that as `--mtp-gguf`:
+Some repacks are published without the MTP block, and `strata-q36` then refuses them with
+`missing qwen35moe.nextn_predict_layers` even without `--mtp`. Check the model's own repository first: the official
+`AtomicChat/Ornith-1.5-35B-A3B-GGUF` ships `mtp-Ornith-1.5-35B-A3B-Q8_0.gguf` next to the quants.
 
-```
-python tools/extract_mtp.py "Ornith-1.5-35B-Q4_K_M.gguf" "mtp-blk40-ornith35b.gguf"
-strata.exe --native Ornith-1.5-35B-A3B-AD-Q6_K.gguf --max-context 262144 --mtp 2 --mtp-gguf mtp-blk40-ornith35b.gguf
-```
+If you do not have that file, there are two ways to get a working head:
 
-The loader requires every tensor of the `--mtp-gguf` file to start with `blk.<n_layers>.`, which is what the tool
-writes.
+1. **Extract it from a quant that carries it.** The block is named `blk.<n_layers>.*`: 20 tensors for the 35B, a full
+   layer plus the `nextn.*` projections.
 
-Measured on the AD Q6_K file, RTX 3090, 2,739-token prompt, 120 generated: **49.7 tok/s** with `--mtp 0` and
-**67.9 tok/s** with the extracted head, draft acceptance 79 of 84. A head converted from the original Ornith
-checkpoint is untrained (0 of 22 drafts measured) and is not a substitute for this one.
+   ```
+   python tools/extract_mtp.py "Ornith-1.5-35B-Q4_K_M.gguf" "mtp-blk40-ornith35b.gguf"
+   strata.exe --native <file>.gguf --max-context 262144 --mtp 2 --mtp-gguf mtp-blk40-ornith35b.gguf
+   ```
+
+   The loader requires every tensor of the `--mtp-gguf` file to start with `blk.<n_layers>.`, which is what the tool
+   writes.
+
+2. **Download one:** [SizorCloud/Ornith-1.5-35B-A3B-MTP](https://huggingface.co/SizorCloud/Ornith-1.5-35B-A3B-MTP)
+   holds a head derived from Qwen3.6-35B-A3B.
+
+Measured on `Ornith-1.5-35B-A3B-AD-Q6_K.gguf`, RTX 3090, 2,739-token prompt, 120 generated:
+
+| head | decode | drafts |
+|---|---|---|
+| none (`--mtp 0`) | 49.7 tok/s | 0 |
+| derived from Qwen3.6-35B-A3B | 58.3 tok/s | 65 of 110 (59%) |
+| extracted from Ornith-1.5-35B-Q4_K_M | **67.9 tok/s** | **79 of 84 (94%)** |
+
+The head from the same model family stays closest.
+
+One trap: the server applies a default presence penalty of 1.5 when a config has no `sampling` block, and that
+disables MTP drafts entirely (`drafts accepted 0 of 0`). Put `"presence_penalty": 0.0` in the config's `sampling`.
 
 ## Note
 
