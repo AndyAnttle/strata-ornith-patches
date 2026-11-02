@@ -49,8 +49,8 @@ Three interleaved runs against the previous engine (built on the pre-release 0.1
 ## Files without an MTP block
 
 Some repacks are published without the MTP block, and `strata-q36` then refuses them with
-`missing qwen35moe.nextn_predict_layers` even without `--mtp`. Check the model's own repository first: the official
-`AtomicChat/Ornith-1.5-35B-A3B-GGUF` ships `mtp-Ornith-1.5-35B-A3B-Q8_0.gguf` next to the quants.
+`missing qwen35moe.nextn_predict_layers` even without `--mtp`. Check the GGUF repository you took the model from first:
+`AtomicChat/Ornith-1.5-35B-A3B-GGUF`, for one, ships `mtp-Ornith-1.5-35B-A3B-Q8_0.gguf` next to its quants.
 
 If you do not have that file, there are two ways to get a working head:
 
@@ -66,8 +66,8 @@ If you do not have that file, there are two ways to get a working head:
    writes.
 
 2. **Download one:** [SizorCloud/Ornith-1.5-35B-A3B-MTP](https://huggingface.co/SizorCloud/Ornith-1.5-35B-A3B-MTP)
-   holds two, both measured below: `mtp-Ornith-1.5-35B-A3B-Q4_K_M-extracted.gguf` (the block taken out of
-   Ornith-1.5-35B-Q4_K_M) and `mtp-Qwen3.6-35B-A3B-Q8_0.gguf` (taken from Qwen3.6-35B-A3B).
+   holds two, both measured below: `mtp-Ornith-1.5-35B-A3B-Q4_K_M-extracted.gguf` (the block taken out of a Q4_K_M
+   GGUF of Ornith-1.5-35B) and `mtp-Qwen3.6-35B-A3B-Q8_0.gguf` (taken from Qwen3.6-35B-A3B).
 
 Measured on `Ornith-1.5-35B-A3B-AD-Q6_K.gguf`, RTX 3090, 2,739-token prompt, 120 generated:
 
