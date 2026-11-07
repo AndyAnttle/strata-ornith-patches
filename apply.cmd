@@ -18,6 +18,9 @@ if errorlevel 1 goto :nopython
 
 pushd "%TREE%"
 patch -p1 --forward --batch --no-backup-if-mismatch < "%HERE%patches\01-ornith-qwen35-0.2.9.diff"
+rem --kv-grow (v0.2.9-r2): the KV holds VRAM only as far as the context reaches.
+patch -p1 --forward --batch --no-backup-if-mismatch < "%HERE%patches\02-kv-grow.diff"
+
 if errorlevel 1 (
     popd
     echo.

@@ -1,3 +1,30 @@
+# Update v0.2.9-r2: `--kv-grow` - the context maps VRAM only as far as it reaches
+
+The KV cache used to be mapped whole at load: a 262144-token window cost ~2.4 GiB of VRAM before the first token, and that
+memory was never available to the expert cache. `patches/02-kv-grow.diff` maps a small window (8192 cells) and grows on
+demand - a short conversation leaves the rest of the card to the experts, and when the context does grow the engine hands
+whole expert layers back to host memory and takes them again once a short request frees the room.
+
+One RTX 3090, Ornith-1.5-35B Q4_K_M, `--max-context 262144`:
+
+| prompt | stock | with `--kv-grow` |
+|---|---|---|
+| 9,102 tokens | 582 tok/s | 1,304 tok/s |
+| 23,204 tokens | - | 1,235 tok/s |
+| 987 tokens after a long one | - | 1,192 tok/s |
+
+Enable with `--kv-grow on` (or `STRATA_KV_GROW=1` in the environment; HOST.cmd's one-card mode asks for it). Knobs:
+`--kv-grow-window` (cells mapped at load, default 8192), `--kv-grow-max` (how far the conversation may grow, defaults to
+`--max-context`) and `--kv-grow-floor` (VRAM left free: 256 MiB on a dedicated card, 4-5 GiB on the one that drives the
+desktop).
+
+Limits: `--batch > 1` (several decoding sessions) is refused with a message; the context is rounded up to the nearest
+value whose KV head spans a whole number of 2 MiB granules (32768 cells x 288 B = 4.5 granules, so it becomes 131072),
+while the cap stays what the config asked for. The failure modes this cost, the eviction design and the full numbers are
+in the section further down.
+
+---
+
 # Ornith-1.5 patches for Strata v0.2.9 (r1)
 
 One consolidated diff that lets the released Strata v0.2.9 source (engine 0.1.55, commit `c62d5e3a`) serve

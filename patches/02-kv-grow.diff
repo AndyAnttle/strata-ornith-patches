@@ -1,0 +1,861 @@
+diff --git a/src/qwen35/q36_engine.cu b/src/qwen35/q36_engine.cu
+index e6ce032a..fc18e4c6 100644
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -19,6 +19,9 @@
+ // file), --bench-pp N / --bench-tg N.  The opt-ins (--kv, --gqa-attn, ...): docs/QWEN36.md.
+ #include <fstream>
+ #include <iterator>
++#if !defined(__HIP_PLATFORM_AMD__)
++#include <cuda.h>   // --kv-grow: the driver's virtual memory (cuMemAddressReserve and the rest)
++#endif
+ 
+ #include "strata/artifact/dequant.hpp"
+ #include "strata/artifact/gguf_reader.hpp"
+@@ -44,6 +47,7 @@
+ #include <cuda_runtime.h>
+ 
+ #include <algorithm>
++#include <numeric>   // std::gcd: the KV layout must line up with the 2 MiB granule
+ #include <cctype>
+ #include <atomic>
+ #include <chrono>
+@@ -1259,6 +1263,165 @@ struct ImgKey {
+     bool operator==(const ImgKey& o) const { return cell == o.cell && n == o.n && hash == o.hash; }
+ };
+ 
++// ---- --kv-grow: the KV's address range reserved once, its pages mapped as far as the context reaches ----------------
++// A KV buffer is indexed (head * ctx + pos) * cell, so its address range must cover the whole --max-context; a plain
++// cudaMalloc therefore also commits the whole context's memory at load, which on a 12-24 GB card is memory the expert
++// cache needs for a conversation that may never reach it.  CUDA's virtual memory keeps the range and lets the pages
++// arrive later: on the owner's box a 4 GiB reservation cost 0 MiB of free memory, each 256 MiB mapping cost exactly
++// that, un-mapping gave it back, and the range read back bit-exact.
++struct KvRes {
++    CUdeviceptr va = 0;          // the whole range (max-context cells per head); valid from the first mapping on
++    size_t bytes = 0;            // that range's size
++    size_t cell = 0;             // bytes per cell
++    int heads = 1;               // KV heads: the layout is (head * ctx + pos) * cell, so each head is its own span
++    size_t head_cells = 0;       // ctx, the cells one head holds
++    std::vector<size_t> mapped;  // per head: bytes mapped from its granularity-aligned span start
++};
++#if !defined(__HIP_PLATFORM_AMD__)
++inline CUmemAllocationProp kv_prop(int dev) {
++    CUmemAllocationProp p{};
++    p.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++    p.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    p.location.id = dev;
++    p.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
++    return p;
++}
++inline size_t kv_granularity(int dev) {
++    size_t g = 0;
++    CUmemAllocationProp p = kv_prop(dev);
++    if (cuMemGetAllocationGranularity(&g, &p, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || g == 0)
++        return (size_t) 2 << 20;
++    return g;
++}
++inline bool kv_vmm_supported(int dev) {
++    int v = 0;
++    return cuDeviceGetAttribute(&v, CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED, dev) == CUDA_SUCCESS && v != 0;
++}
++/// Reserve the address range of `heads` x `head_cells` cells; nothing is backed yet, so this costs no device memory.
++inline bool kv_reserve(KvRes& r, int heads, size_t head_cells, size_t cell, int dev, std::string& err) {
++    const size_t g = kv_granularity(dev);
++    const size_t bytes = (size_t) heads * head_cells * cell;
++    const size_t want = (bytes + g - 1) / g * g;
++    if (cuMemAddressReserve(&r.va, want, g, 0, 0) != CUDA_SUCCESS) {
++        err = "cuMemAddressReserve failed for " + std::to_string(want >> 20) + " MiB";
++        return false;
++    }
++    r.bytes = want;
++    r.cell = cell;
++    r.heads = heads;
++    r.head_cells = head_cells;
++    r.mapped.assign((size_t) heads, 0);
++    return true;
++}
++/// Map, per head, the first `cells` cells: the layout puts head h at h * head_cells * cell, so one contiguous prefix
++/// would back head 0 only and the attention kernels would read uncommitted addresses of the others.  Each head's span
++/// start is rounded DOWN to the granularity and its mapped length is tracked, so a growth step maps the new tail only.
++/// New pages are zeroed: a shorter prompt never writes cells the attention path still reads.
++inline bool kv_commit_to(KvRes& r, size_t cells, int dev, std::string& err) {
++    if (r.va == 0) return true;
++    const size_t g = kv_granularity(dev);
++    const size_t want = std::min(cells, r.head_cells) * r.cell;
++    if (want == 0) return true;
++    CUmemAllocationProp p = kv_prop(dev);
++    CUmemAccessDesc ad{};
++    ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    ad.location.id = dev;
++    ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    for (int h = 0; h < r.heads; ++h) {
++        const size_t span = (size_t) h * r.head_cells * r.cell;     // this head's offset in the buffer
++        const size_t base = span & ~(g - 1);                        // cuMemMap wants a granularity-aligned address
++        const size_t need = (span - base) + want;                   // what this head must have mapped, from base
++        const size_t target = (need + g - 1) / g * g;
++        size_t& have = r.mapped[(size_t) h];
++        while (have < target) {
++            size_t step = std::min(target - have, (size_t) 256 << 20);
++            step = (step + g - 1) / g * g;
++            // A mapping the card cannot really hold is what Windows answers by moving memory to shared memory, and the
++            // desktop then crawls at 99% 3D: refuse instead, before the driver can decide for us.
++            size_t fr = 0, tot = 0;
++            (void) cudaMemGetInfo(&fr, &tot);
++            // the first mapping has to leave the card its reserve; later ones grow in 2 MiB steps and are limited by
++            // the expert cache giving memory back, so a big margin here would evict a layer per granule
++            const size_t floor_b = have == 0 ? ((size_t) 256 << 20) : ((size_t) 64 << 20);
++            if (fr < step + floor_b) {
++                err = "only " + std::to_string(fr >> 20) + " MiB free, " + std::to_string(step >> 20) +
++                      " MiB needed plus a 256 MiB floor (at " + std::to_string(cells) + " cells)";
++                return false;
++            }
++            CUmemGenericAllocationHandle hh = 0;
++            if (cuMemCreate(&hh, step, &p, 0) != CUDA_SUCCESS) {
++                err = "out of device memory mapping " + std::to_string(step >> 20) + " MiB of KV (head " +
++                      std::to_string(h) + " at " + std::to_string(cells) + " cells)";
++                return false;
++            }
++            const CUdeviceptr at = r.va + base + have;
++            CUresult mr = cuMemMap(at, step, 0, hh, 0);
++            if (mr == CUDA_ERROR_INVALID_VALUE) {
++                // the address is still mapped somewhere: take it back and try once
++                (void) cuMemUnmap(at, step);
++                mr = cuMemMap(at, step, 0, hh, 0);
++            }
++            if (mr != CUDA_SUCCESS) {
++                size_t fr2 = 0, tot2 = 0;
++                (void) cudaMemGetInfo(&fr2, &tot2);
++                std::fprintf(stderr,
++                             "strata-q36: --kv-grow: cuMemMap at %zu (head %d, step %zu, have %zu) -> %d, free %zu MiB\n",
++                             (size_t) at, h, step, have, (int) mr, fr2 >> 20);
++                (void) cuMemRelease(hh);
++                err = "cuMemMap failed (head " + std::to_string(h) + ")";
++                return false;
++            }
++            (void) cuMemRelease(hh);
++            if (cuMemSetAccess(at, step, &ad, 1) != CUDA_SUCCESS) {
++                (void) cuMemUnmap(at, step);
++                err = "cuMemSetAccess failed";
++                return false;
++            }
++            if (cudaMemset((void*) at, 0, step) != cudaSuccess) {
++                err = "zeroing the new KV pages failed";
++                return false;
++            }
++            have += step;
++        }
++    }
++    return true;
++}
++/// --kv-grow: unmap the KV's pages past `cells`, so a request that needs little context can hand the memory back
++/// to the expert cache.  The layout is (head * ctx + pos) * cell: every head keeps its own granular span.
++inline void kv_shrink_to(KvRes& r, int64_t cells, int dev) {
++    if (r.va == 0 || r.heads <= 0) return;
++    const size_t g = kv_granularity(dev);
++    const size_t want_cells = (size_t) std::max<int64_t>(0, std::min<int64_t>(cells, (int64_t) r.head_cells));
++    const size_t want = ((want_cells * r.cell) + g - 1) / g * g;
++    for (int h = 0; h < r.heads; ++h) {
++        const size_t span = (size_t) h * r.head_cells * r.cell;
++        const size_t base = span & ~(g - 1);
++        while ((size_t) h < r.mapped.size() && r.mapped[(size_t) h] > want) {
++            const size_t step = std::min(r.mapped[(size_t) h] - want, g * 16);
++            if (cuMemUnmap(r.va + base + r.mapped[(size_t) h] - step, step) != CUDA_SUCCESS) break;
++            r.mapped[(size_t) h] -= step;
++        }
++    }
++}
++
++inline void kv_release(KvRes& r, int dev) {
++    if (r.va == 0) return;
++    const size_t g = kv_granularity(dev);
++    for (int h = 0; h < r.heads; ++h) {
++        const size_t span = (size_t) h * r.head_cells * r.cell;
++        const size_t base = span & ~(g - 1);
++        if (r.mapped[(size_t) h] > 0) (void) cuMemUnmap(r.va + base, r.mapped[(size_t) h]);
++    }
++    (void) cuMemAddressFree(r.va, r.bytes);
++    r = KvRes{};
++}
++#else
++inline bool kv_vmm_supported(int) { return false; }
++inline bool kv_reserve(KvRes&, int, size_t, size_t, int, std::string& err) { err = "not built for CUDA"; return false; }
++inline bool kv_commit_to(KvRes&, size_t, int, std::string&) { return true; }
++inline void kv_release(KvRes& r, int) { r = KvRes{}; }
++#endif
++
+ struct Engine {
+     const Model* m = nullptr;
+     cudaStream_t st = nullptr;
+@@ -1266,6 +1429,22 @@ struct Engine {
+     bool kv8 = false;   // --kv int8: the K / V cache as q8_0 rows (kv_cell_bytes), else fp32
+     bool kv_v4 = false; // --kv k8v4: kv8's K, V as rotated q4_0 (q36attn::q4_cell); the grouped-query kernel always
+     bool kv_f16 = false;  // --kv fp16; cache pointers/tables hold opaque storage in either format
++    // --kv-grow: the KV's address range is reserved for the whole --max-context, its device pages are mapped only as
++    // far as the context has reached (kv_reserve / kv_commit_to).  A short conversation then leaves the rest of the
++    // card's memory to the expert cache, which is what a 12-24 GB card is short of.  The growth beyond the window
++    // mapped at load comes out of the card's free headroom: when it runs out the engine says so and stops rather than
++    // reading cells that were never mapped.
++    bool kv_grow = false;
++    int64_t kv_grow_window = 8192;   // cells mapped at load
++    // What the expert placement must NOT take: the KV's remaining commitment less the part the card's own reserve can
++    // absorb later.  Without this the placement sizes the cache from cudaMemGetInfo, which knows nothing of the
++    // address-only reservation, and a growing context then has to page the card into shared memory (Windows does not
++    // refuse - it moves the model and the desktop freezes at 99% 3D).
++    size_t kv_grow_floor = (size_t) 256 << 20;   // --kv-grow-floor MiB: free VRAM the cache must leave
++    size_t kv_free_ref = 0;                      // free VRAM after our own last mapping: the yardstick for "someone else took it"         // bytes withheld from the expert budget
++
++    int64_t kv_grow_max_cells = 0;   // --kv-grow-max N: the cells the context may reach (0: --max-context)
++    // The cache withholds exactly what the KV needs to reach that cap, so reaching it can never page the card.
+     int64_t pos = 0;   // cells holding a processed token
+     // activations [tmax][...]
+     float *x, *h, *y, *qkv, *hc, *z, *alpha, *beta, *gdn_y, *qg, *kx, *vx, *q, *gate, *att, *logits_r, *eparts, *moe_out,
+@@ -1324,6 +1503,7 @@ struct Engine {
+     // members conv / S / kc / vc / pos / hlast above are the CURRENT session's (select() swaps them).
+     struct Sess {
+         std::vector<float*> conv, S, kc, vc;
++        std::vector<KvRes> kres, vres;      // --kv-grow: one reservation per kc / vc buffer (empty when off)
+         float* hlast = nullptr;
+         int64_t pos = 0;
+         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
+@@ -1450,6 +1630,359 @@ struct Engine {
+     size_t kv_cell_v() const { return kv_v4 ? sizeof(q36attn::q4_cell) : kv_cell(); }
+     float* alloc_kv(size_t cells, size_t cell_bytes) const { return reinterpret_cast<float*>(dalloc_t<uint8_t>(cells * cell_bytes)); }
+ 
++    /// A KV buffer: the plain full-size allocation, or (--kv-grow) an address range with only the first window mapped.
++    float* alloc_kv_res(std::vector<KvRes>& res, size_t cells, size_t cell_bytes, int heads) const {
++        if (!kv_grow) return alloc_kv(cells, cell_bytes);   // stock path, no reservation record
++        int dev = 0;
++        (void) cudaGetDevice(&dev);
++        KvRes r;
++        std::string err;
++        const size_t cells0 = (size_t) std::min<int64_t>((int64_t) cells, std::max<int64_t>(1, kv_grow_window));
++        if (!kv_reserve(r, heads, cells, cell_bytes, dev, err) ||
++            !kv_commit_to(r, cells0, dev, err)) {
++            std::fprintf(stderr, "strata-q36: --kv-grow: %s\n", err.c_str());
++            std::exit(2);
++        }
++        res.push_back(r);
++        return reinterpret_cast<float*>(r.va);
++    }
++
++    // --kv-grow's other half: the expert slots are mapped through the same virtual memory as the KV, so a growing
++    // context can take the tail slots back (their host copies already exist: an eviction is bookkeeping, not a copy).
++    struct SlotPool {
++        CUdeviceptr va = 0;      // the whole range (n_slots slots of stride_pad bytes)
++        size_t bytes = 0;        // its size
++        size_t stride = 0;       // per-slot stride, a multiple of the granularity
++        int slots = 0;           // slots the range holds
++        int mapped = 0;          // 1 while the range is mapped
++        uint8_t* host_blob = nullptr;   // a fully resident layer has no host arena: made on the first eviction
++        size_t gran = 0;
++    };
++    std::vector<SlotPool> slot_pools;   // one per layer, in m.layers order (+ the MTP block)
++    std::vector<int> slot_pool_layer;   // its index in `hy`
++    std::vector<Layer*> slot_pool_layers;   // the same layer, for the fields a kernel loops over
++
++    /// --kv-grow: map a pool's whole range in one go (or again after an eviction).  The range is granular, the
++    /// slot stride inside it is NOT: the hybrid kernels index every expert with that exact stride.
++    bool slot_pool_map(SlotPool& sp, int dev, std::string& err) {
++        CUmemAllocationProp prop = kv_prop(dev);
++        CUmemGenericAllocationHandle h = 0;
++        if (cuMemCreate(&h, sp.bytes, &prop, 0) != CUDA_SUCCESS) {
++            err = "out of device memory for the expert slots of a layer";
++            return false;
++        }
++        if (cuMemMap(sp.va, sp.bytes, 0, h, 0) != CUDA_SUCCESS) {
++            (void) cuMemRelease(h);
++            err = "cuMemMap failed for the expert slots of a layer";
++            return false;
++        }
++        (void) cuMemRelease(h);
++        CUmemAccessDesc ad{};
++        ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++        ad.location.id = dev;
++        ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++        if (cuMemSetAccess(sp.va, sp.bytes, &ad, 1) != CUDA_SUCCESS) {
++            (void) cuMemUnmap(sp.va, sp.bytes);
++            err = "cuMemSetAccess failed for the expert slots of a layer";
++            return false;
++        }
++        return true;
++    }
++
++    /// --kv-grow: reserve a layer's slot range and map it.  One range, one mapping: an eviction takes the whole
++    /// layer back at once, which keeps the stride (and therefore the kernels) untouched.
++    bool slot_pool_alloc(SlotPool& sp, size_t stride, int slots, int dev, std::string& err) {
++        if (!kv_vmm_supported(dev)) { err = "no virtual memory on this device"; return false; }
++        sp.gran = kv_granularity(dev);
++        sp.stride = stride;
++        sp.slots = slots;
++        // the callers memset stride*slots + kMmqTail, so the tail gets room too; the range is granular anyway
++        sp.bytes = ((size_t) slots * stride + ((size_t) 2 << 20) + sp.gran - 1) / sp.gran * sp.gran;
++        if (cuMemAddressReserve(&sp.va, sp.bytes, sp.gran, 0, 0) != CUDA_SUCCESS) {
++            err = "cuMemAddressReserve failed for " + std::to_string(sp.bytes >> 20) + " MiB of expert slots";
++            return false;
++        }
++        if (!slot_pool_map(sp, dev, err)) {
++            (void) cuMemAddressFree(sp.va, sp.bytes);
++            sp.va = 0;
++            return false;
++        }
++        sp.mapped = 1;
++        return true;
++    }
++
++    /// --kv-grow: hand back up to `want` bytes of slot memory, one tail slot at a time, evicting the expert each holds.
++    /// Only legal between batches: the caller runs it at the start of a forward pass, before any kernel is queued.
++    /// --kv-grow: the card can lose memory to another program at any moment.  When the free VRAM falls below the floor,
++    /// hand expert layers back BEFORE the driver starts paging ours out: a slower model instead of a stalled desktop.
++    void kv_relieve_pressure() {
++        if (!kv_grow || slot_pools.empty()) return;
++        size_t fr = 0, tot = 0;
++        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) return;
++        if (kv_free_ref == 0) {
++            // First look after loading: the placement may have filled the card down to its own reserve, and the
++            // watchdog cannot see that as a drop.  Bring the card to the floor before the first batch runs.
++            kv_free_ref = fr;
++            if (fr >= kv_grow_floor) return;
++            const size_t want0 = kv_grow_floor - fr;
++            (void) cudaDeviceSynchronize();
++            const size_t got0 = slot_give_back(want0);
++            (void) cudaMemGetInfo(&kv_free_ref, &tot);
++            if (got0) {
++                std::fprintf(stderr, "strata-q36: --kv-grow: %zu MiB of expert slots given back at startup (free VRAM "
++                                     "%zu MiB, floor %zu MiB)\n", got0 >> 20, fr >> 20, kv_grow_floor >> 20);
++            }
++            return;
++        }
++        // Our own growth also lowers the free memory, and reacting to that would cost the very speed this buys:
++        // only a drop we did not cause counts as another program taking the card.
++        const size_t was = kv_free_ref;
++        const bool taken_by_others = fr + ((size_t) 64 << 20) < was;
++        if (!taken_by_others || fr >= kv_grow_floor) {
++            kv_free_ref = fr;
++            return;
++        }
++        const size_t want = std::max(kv_grow_floor - fr, (size_t) 128 << 20);
++        (void) cudaDeviceSynchronize();
++        const size_t got = slot_give_back(want);
++        (void) cudaMemGetInfo(&kv_free_ref, &tot);
++        if (got) {
++            std::fprintf(stderr, "strata-q36: --kv-grow: %zu MiB of expert slots given back (free VRAM fell to %zu MiB "
++                                 "from %zu, floor %zu)\n", got >> 20, fr >> 20, was >> 20, kv_grow_floor >> 20);
++        }
++    }
++
++    /// --kv-grow: a request needs `cells` cells: give the rest of the KV back, then fill the card with experts again.
++    void kv_trim(int64_t cells) {
++        if (!kv_grow) return;
++        int dev = 0;
++        (void) cudaGetDevice(&dev);
++        (void) cudaDeviceSynchronize();
++        size_t freed = 0;
++        for (Sess& ss : sess) {
++            for (KvRes& r : ss.kres) {
++                const size_t before = r.mapped.empty() ? 0 : r.mapped[0];
++                kv_shrink_to(r, cells, dev);
++                if (!r.mapped.empty() && r.mapped[0] < before) freed += before - r.mapped[0];
++            }
++            for (KvRes& r : ss.vres) {
++                const size_t before = r.mapped.empty() ? 0 : r.mapped[0];
++                kv_shrink_to(r, cells, dev);
++                if (!r.mapped.empty() && r.mapped[0] < before) freed += before - r.mapped[0];
++            }
++        }
++        if (freed > 0) std::fprintf(stderr, "strata-q36: --kv-grow: %zu MiB of KV given back for a %lld-cell request\n",
++                                    freed >> 20, (long long) cells);
++        (void) slot_take_back(0);
++        {   // the take_back moved the number on purpose: the watchdog must not read that as another program's doing
++            size_t fr = 0, tot = 0;
++            if (cudaMemGetInfo(&fr, &tot) == cudaSuccess) kv_free_ref = fr;
++        }
++    }
++
++    /// --kv-grow: the other direction - a request that needs little context gives the KV's tail back and the expert
++    /// slots return to the card.  `want` is a budget in bytes; 0 means "everything that fits".
++    size_t slot_take_back(size_t want) {
++        if (slot_pools.empty()) return 0;
++        int dev = 0;
++        (void) cudaGetDevice(&dev);
++        size_t got = 0;
++        std::string err;
++        for (size_t pi = 0; pi < slot_pools.size(); ++pi) {
++            if (want && got >= want) break;
++            SlotPool& sp = slot_pools[pi];
++            if (sp.mapped) continue;
++            if (!slot_pool_map(sp, dev, err)) break;   // the card is full again: the rest stays on the host
++            SlotPool& pool = slot_pools[pi];
++            Engine::Hy& H = hy[(size_t) slot_pool_layer[pi]];
++            Layer* L = pi < slot_pool_layers.size() ? slot_pool_layers[pi] : nullptr;
++            for (int s2 = 0; s2 < pool.slots; ++s2) {
++                const int e = (size_t) s2 < H.exp_in_slot.size() ? H.exp_in_slot[(size_t) s2] : -1;
++                if (e < 0 || !L) continue;
++                (void) cudaMemcpyAsync(reinterpret_cast<void*>(pool.va + (size_t) s2 * pool.stride),
++                                       L->hblobs + (size_t) e * pool.stride, pool.stride,
++                                       cudaMemcpyHostToDevice, st);
++                H.slot_of[(size_t) e] = s2;
++                if (H.slot_of_d) (void) cudaMemcpyAsync(H.slot_of_d + (size_t) e, &H.slot_of[(size_t) e],
++                                                        sizeof(int32_t), cudaMemcpyHostToDevice, st);
++            }
++            if (L) L->n_slots = pool.slots;
++            pool.mapped = 1;
++            got += pool.bytes;
++            std::fprintf(stderr, "strata-q36: --kv-grow: %zu MiB of expert slots taken back (layer %zu)\n",
++                         pool.bytes >> 20, pi);
++        }
++        return got;
++    }
++
++    /// --kv-grow: everything a fully resident layer needs to be handled as a hybrid one.  A layer placed with every
++    /// expert in VRAM has no slot table, no score history and no activation format descriptor, and the CPU lane
++    /// indexes all three by expert id.  Done at LOAD for pool-backed layers, so an eviction never has to invent them.
++    void hy_prepare(Layer& L, size_t li) {
++        Engine::Hy& H = hy[li];
++        const int ne_all = (int) m->g.n_expert;
++        if ((int) H.slot_of.size() < ne_all) {
++            H.slot_of.assign((size_t) ne_all, -1);
++            H.exp_in_slot.assign((size_t) L.n_slots, -1);
++            for (int i = 0; i < L.n_slots && i < ne_all; ++i) {
++                H.exp_in_slot[(size_t) i] = i;
++                H.slot_of[(size_t) i] = i;
++            }
++            if (!H.slot_of_d) CK(cudaMalloc(&H.slot_of_d, (size_t) ne_all * sizeof(int32_t)));
++            CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne_all * sizeof(int32_t), cudaMemcpyHostToDevice));
++        }
++        if ((int) H.score.size() < ne_all) H.score.assign((size_t) ne_all, 0.0);
++        if (H.fmt.up_off != L.L.up_off) {
++            std::string e4;
++            if (!strata::kernels::cpu::native_fmt(L.L.gu_type, L.L.d_type, (int) m->g.n_embd, (int) m->g.n_ff,
++                                                  H.fmt, e4)) {
++                std::fprintf(stderr, "strata-q36: --kv-grow: %s\n", e4.c_str());
++            }
++        }
++    }
++
++    size_t slot_give_back(size_t want) {
++        size_t freed = 0;
++        // whole layers, from the last one back: the stride inside a pool never changes, so the kernels that index
++        // experts by it keep reading the right memory.  The experts of an evicted layer fall back to the host copies.
++        for (size_t pi = slot_pools.size(); pi-- > 0 && freed < want;) {
++            SlotPool& sp = slot_pools[pi];
++            if (!sp.mapped) continue;
++            Layer* Lp = pi < slot_pool_layers.size() ? slot_pool_layers[pi] : nullptr;
++            const int ne_all = (int) m->g.n_expert;
++            if (Lp) hy_prepare(*Lp, (size_t) slot_pool_layer[pi]);
++            if (Lp && !Lp->hblobs) {
++                // nothing on the host to fall back to yet: take the layer across the bus first (0.5 GiB, tens of ms)
++                if (!sp.host_blob) {
++                    void* hb = nullptr;
++                    if (cudaHostAlloc(&hb, sp.bytes, cudaHostAllocDefault) != cudaSuccess || !hb) {
++                        std::fprintf(stderr, "strata-q36: --kv-grow: no host memory to evict a layer into\n");
++                        return freed;
++                    }
++                    sp.host_blob = reinterpret_cast<uint8_t*>(hb);
++                }
++                CK(cudaMemcpy(sp.host_blob, reinterpret_cast<void*>(sp.va),
++                              (size_t) sp.slots * sp.stride, cudaMemcpyDeviceToHost));
++                Lp->hblobs = sp.host_blob;
++            }
++            (void) cuMemUnmap(sp.va, sp.bytes);
++            sp.mapped = 0;
++            Engine::Hy& H = hy[(size_t) slot_pool_layer[pi]];
++            // A layer placed in full has no slot table at all (every expert is in VRAM), and the CPU lane indexes
++            // slot_of by expert id: without this it reads past an empty vector the moment the layer is evicted.
++            for (int e = 0; e < ne_all; ++e) {
++                H.slot_of[(size_t) e] = -1;
++                if (H.slot_of_d) (void) cudaMemcpyAsync(H.slot_of_d + (size_t) e, &H.slot_of[(size_t) e],
++                                                        sizeof(int32_t), cudaMemcpyHostToDevice, st);
++            }
++            // exp_in_slot is KEPT: it is the layer's layout, and a later take_back copies the experts
++            // straight into the same slots.  Only slot_of goes away, so the kernels send them to the CPU lane.
++            // the layer must stop claiming resident experts: n_slots is what the kernels loop over, and the range is
++            // unmapped now, so a slot beyond 0 would be read from memory that is no longer there
++            if (pi < slot_pool_layers.size() && slot_pool_layers[pi]) slot_pool_layers[pi]->n_slots = 0;
++            freed += sp.bytes;
++        }
++        return freed;
++    }
++
++    /// --kv-grow: what the expert placement must leave for the context.  The KV's range is reserved but its pages are
++    /// mapped only as far as the window, so free memory overstates what a long conversation can have: the difference
++    /// is withheld from the cache, except for the part the card's own reserve (one fifth on a shared card, 768 MiB on a
++    /// dedicated one) can absorb at growth time.  Called once, before place_experts.
++    void kv_grow_plan(bool shared_card) {
++        if (!kv_grow) return;
++        size_t full = 0, done = 0;
++        for (const Sess& ss : sess) {
++            for (const KvRes& r : ss.kres) {
++                full += r.bytes;
++                for (size_t m : r.mapped) done += m;
++            }
++            for (const KvRes& r : ss.vres) {
++                full += r.bytes;
++                for (size_t m : r.mapped) done += m;
++            }
++        }
++        size_t fr = 0, tot = 0;
++        (void) cudaMemGetInfo(&fr, &tot);
++        const size_t reserve = shared_card ? std::min<size_t>((size_t) 2560 << 20,
++                                                             std::max<size_t>((size_t) 768 << 20, tot / 5))
++                                          : (size_t) 768 << 20;
++        // What the context may reach: the cap when one is given, else the whole --max-context.
++        size_t cap = full;
++        if (kv_grow_max_cells > 0) {
++            cap = 0;
++            for (const Sess& ss : sess) {
++                for (const KvRes& r : ss.kres) cap += (size_t) std::min<int64_t>(kv_grow_max_cells, (int64_t) r.head_cells) * r.cell;
++                for (const KvRes& r : ss.vres) cap += (size_t) std::min<int64_t>(kv_grow_max_cells, (int64_t) r.head_cells) * r.cell;
++            }
++        }
++        const size_t need = cap > done ? cap - done : 0;
++        // The whole growth need is withheld: the reserve is what keeps the desktop and other programs alive, not a
++        // budget the context may eat (measured: a card filled to 0 MiB free refused the very first growth step).
++        // the cache takes the whole card: when the context needs the memory, the slots go back one layer at a
++        // time, and a short request afterwards takes them again.  Withholding it up front would cost the
++        // very speed this flag exists for.
++        (void) reserve;
++        std::fprintf(stderr, "strata-q36: --kv-grow: %zu MiB of %zu MiB of KV mapped now; the cache may use the rest, "
++                             "it gives it back as the context grows\n", done >> 20, full >> 20);
++    }
++
++    /// --kv-grow: map the KV pages a batch at positions [0, cells) reaches.  Called before every forward pass.
++    bool kv_ensure(int64_t cells) {
++        if (!kv_grow) return true;
++        kv_relieve_pressure();   // another program may have taken memory since the last batch
++        const int64_t cap = kv_grow_max_cells > 0 ? kv_grow_max_cells : (int64_t) ctx;
++        if (cells > cap) {
++            std::fprintf(stderr, "strata-q36: --kv-grow: the conversation reached %lld cells, past --kv-grow-max %lld: "
++                                 "start again with a larger --kv-grow-max (it costs expert slots) or without --kv-grow\n",
++                         (long long) cells, (long long) cap);
++            return false;
++        }
++        int dev = 0;
++        (void) cudaGetDevice(&dev);
++        std::string err;
++        for (Sess& ss : sess) {
++            for (int pass = 0; pass < 2; ++pass) {
++                std::vector<KvRes>& vec = pass == 0 ? ss.kres : ss.vres;
++                for (KvRes& r : vec) {
++                    bool ok = kv_commit_to(r, (size_t) cells, dev, err);
++                    // --kv-grow: the context needs memory the expert cache holds.  Slots go back one at a time (each
++                    // expert already has its host copy), then the mapping is retried: no data moves, no crash.
++                    for (int attempt = 0; !ok && attempt < 64 && !slot_pools.empty(); ++attempt) {
++                        // how much this buffer still has to map, heads included: asking for all of it keeps the
++                        // eviction to one round instead of a layer per 2 MiB granule
++                        size_t deficit = 0;
++                        {
++                            const size_t g = kv_granularity(dev);
++                            for (int h = 0; h < r.heads && (size_t) h < r.mapped.size(); ++h) {
++                                const size_t want_cells = (size_t) std::min<int64_t>(cells, (int64_t) r.head_cells);
++                                const size_t want = ((want_cells * r.cell) + g - 1) / g * g;
++                                if (want > r.mapped[(size_t) h]) deficit += want - r.mapped[(size_t) h];
++                            }
++                        }
++                        (void) cudaDeviceSynchronize();   // the batch still reading those slots must be done first
++                        const size_t got = slot_give_back(deficit + ((size_t) 64 << 20));
++                        if (got == 0) break;
++                        std::fprintf(stderr, "strata-q36: --kv-grow: %zu MiB of expert slots given back for the KV at "
++                                             "%lld cells\n", got >> 20, (long long) cells);
++                        ok = kv_commit_to(r, (size_t) cells, dev, err);
++                    }
++                    if (!ok) {
++                        std::fprintf(stderr, "strata-q36: --kv-grow: %s (the conversation reached %lld cells: drop "
++                                             "--kv-grow, or lower --expert-vram so the expert cache leaves the KV "
++                                             "headroom)\n", err.c_str(), (long long) cells);
++                        return false;
++                    }
++                }
++            }
++        }
++        {   // our own mapping moved the number: remember it, so the next look can tell ours from someone else's
++            size_t fr2 = 0, tot2 = 0;
++            if (cudaMemGetInfo(&fr2, &tot2) == cudaSuccess) kv_free_ref = fr2;
++        }
++        return true;
++    }
++
+     void alloc_session(Sess& ss) const {
+         const auto& g = m->g;
+         const size_t C = (size_t) g.ssm_conv_channels;
+@@ -1457,8 +1990,8 @@ struct Engine {
+             if (L.attn) {
+                 ss.conv.push_back(nullptr);
+                 ss.S.push_back(nullptr);
+-                ss.kc.push_back(alloc_kv((size_t) g.n_head_kv * ctx, kv_cell()));
+-                ss.vc.push_back(alloc_kv((size_t) g.n_head_kv * ctx, kv_cell_v()));
++                ss.kc.push_back(alloc_kv_res(ss.kres, (size_t) ctx, kv_cell(), (int) g.n_head_kv));
++                ss.vc.push_back(alloc_kv_res(ss.vres, (size_t) ctx, kv_cell_v(), (int) g.n_head_kv));
+             } else {
+                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
+                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
+@@ -1469,8 +2002,8 @@ struct Engine {
+         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
+             ss.conv.push_back(nullptr);
+             ss.S.push_back(nullptr);
+-            ss.kc.push_back(alloc_kv((size_t) g.n_head_kv * ctx, kv_cell()));
+-            ss.vc.push_back(alloc_kv((size_t) g.n_head_kv * ctx, kv_cell_v()));
++            ss.kc.push_back(alloc_kv_res(ss.kres, (size_t) ctx, kv_cell(), (int) g.n_head_kv));
++            ss.vc.push_back(alloc_kv_res(ss.vres, (size_t) ctx, kv_cell_v(), (int) g.n_head_kv));
+         }
+         ss.hlast = dalloc((size_t) g.n_embd);
+     }
+@@ -2310,6 +2843,7 @@ struct Engine {
+     /// their greedy picks (`pick`).  `verify`: a verify window (the GDN state left for commit()).
+     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
+         const auto& g = m->g;
++        if (kv_grow && !kv_ensure(p0 + T)) std::exit(2);
+         const int N = (int) g.n_embd;
+         if (main_hybrid && T > hybrid_t && use_mmq) {
+             std::vector<int> seq;
+@@ -3167,6 +3701,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     for (Layer& L : m.layers) all.push_back(&L);
+     if (m.has_mtp) all.push_back(&m.mtp);
+     size_t total = 0, per_slot = 0, max_layer = 0;
++    if (E.kv_grow) {
++        // --kv-grow: slots are unmapped one at a time, so each one must be its own granularity-aligned span; the host
++        // arena and every kernel use the same stride, so it is padded here, before anything is allocated or sized.
++        int dev = 0;
++        (void) cudaGetDevice(&dev);
++        const size_t g = kv_granularity(dev);
++        // (the slot stride stays exactly as loaded: the pools below map a whole layer at a time, so nothing
++        //  needs to be granular, and the MMQ kernels keep the layout they expect)
++    }
+     for (Layer* L : all) {
+         total += L->stride * (size_t) ne + kMmqTail;
+         per_slot += L->stride;
+@@ -3174,6 +3717,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     }
+     size_t fr = 0, tot = 0;
+     CK(cudaMemGetInfo(&fr, &tot));
++    // --kv-grow: the KV's address range is reserved but its pages are not mapped, so free memory says nothing about it.
++    // Withhold what the context will need beyond what the card's reserve can absorb, or the cache takes it and the
++    // first long conversation pages the card into shared memory.
+     // The reserve is what stays free after the placement.  A card that also drives the desktop, or that hosts the
+     // vision encoder, grows afterwards: Windows does not refuse an allocation it cannot fit, it moves part of the
+     // model to shared memory, and decode then runs over PCIe at a fraction of the speed while the card reads 100%.
+@@ -3242,8 +3788,28 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     }
+     if (slots <= 0 && total <= budget2 && total + ((size_t) 256 << 20) <= fr) {
+         std::vector<uint8_t> blob;
++        if (E.kv_grow) E.hy.resize(all.size());   // every layer here may be evicted later: its tables must exist
+         for (Layer* L : all) {
+-            CK(cudaMalloc(&L->blobs, L->stride * (size_t) ne + kMmqTail));
++            if (E.kv_grow) {
++                // --kv-grow: even a layer that fits completely lives in a pool, because a growing context has to be
++                // able to take it back later.  A plain cudaMalloc can never be given back.
++                int dev = 0;
++                (void) cudaGetDevice(&dev);
++                Engine::SlotPool sp;
++                std::string e2;
++                if (!E.slot_pool_alloc(sp, L->stride, (int) ne, dev, e2)) {
++                    err = e2;
++                    return false;
++                }
++                L->blobs = reinterpret_cast<uint8_t*>(sp.va);
++                const int idx = L == &m.mtp ? (int) m.layers.size()
++                                            : (int) (L - m.layers.data());
++                E.slot_pool_layer.push_back(idx);
++                E.slot_pool_layers.push_back(L);
++                E.slot_pools.push_back(sp);
++            } else {
++                CK(cudaMalloc(&L->blobs, L->stride * (size_t) ne + kMmqTail));
++            }
+             CK(cudaMemset(L->blobs, 0, L->stride * (size_t) ne + kMmqTail));
+             blob.assign(L->L.bytes, 0);
+             for (int64_t e = 0; e < ne; ++e) {
+@@ -3251,6 +3817,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+                 CK(cudaMemcpy(L->blobs + (size_t) e * L->stride, blob.data(), L->L.bytes, cudaMemcpyHostToDevice));
+             }
+             L->n_slots = (int) ne;
++            if (E.kv_grow) E.hy_prepare(*L, (size_t) (L == &m.mtp ? m.layers.size() : (L - m.layers.data())));
+         }
+         std::fprintf(stderr, "strata-q36: every routed expert in VRAM (%.2f GiB) in %.1f s\n", (double) total / (1 << 30),
+                      ms_since(t0) / 1000.0);
+@@ -3314,7 +3881,24 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     for (size_t li = 0; li < all.size(); ++li) {
+         Layer& L = *all[li];
+         if (mtp_only && &L != &m.mtp) {   // a main layer: every expert in VRAM, as in the all-in-VRAM placement
+-            CK(cudaMalloc(&L.blobs, L.stride * (size_t) ne + kMmqTail));
++            if (E.kv_grow) {
++                // --kv-grow: a pool, not a malloc.  This is the placement a short conversation ends up in, and it must
++                // still be able to hand a layer back when the context grows.
++                int dev = 0;
++                (void) cudaGetDevice(&dev);
++                Engine::SlotPool sp;
++                std::string e2;
++                if (!E.slot_pool_alloc(sp, L.stride, (int) ne, dev, e2)) { err = e2; return false; }
++                L.blobs = reinterpret_cast<uint8_t*>(sp.va);
++                const int idx = &L == &m.mtp ? (int) m.layers.size() : (int) (&L - m.layers.data());
++                E.slot_pool_layer.push_back(idx);
++                E.slot_pool_layers.push_back(&L);
++                E.slot_pools.push_back(sp);
++                L.n_slots = (int) ne;
++                E.hy_prepare(L, li);
++            } else {
++                CK(cudaMalloc(&L.blobs, L.stride * (size_t) ne + kMmqTail));
++            }
+             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) ne + kMmqTail));
+             std::vector<uint8_t> blob(L.L.bytes, 0);
+             for (int64_t e = 0; e < ne; ++e) {
+@@ -3348,7 +3932,24 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+                 if (!taken[(size_t) e]) order.push_back((int) e);
+         }
+         if (S > 0) {
+-            CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
++            if (E.kv_grow) {
++                // --kv-grow: the slots live in a range whose tail can be unmapped for the growing context
++                Engine::SlotPool sp;
++                std::string e2;
++                int dev = 0;
++                (void) cudaGetDevice(&dev);
++                if (!E.slot_pool_alloc(sp, L.stride, S, dev, e2)) {
++                    std::fprintf(stderr, "strata-q36: --kv-grow: %s: the slots take the plain allocation\n", e2.c_str());
++                    CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
++                } else {
++                    L.blobs = reinterpret_cast<uint8_t*>(sp.va);
++                    E.slot_pool_layer.push_back((int) li);
++                    E.slot_pool_layers.push_back(&L);
++                    E.slot_pools.push_back(sp);
++                }
++            } else {
++                CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
++            }
+             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
+             for (int s = 0; s < S; ++s)   // a profile's slots are not the first ids: each expert goes to its own slot
+                 CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) order[(size_t) s] * L.stride,
+@@ -3369,11 +3970,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     }
+     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
+     CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault));
+-    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocDefault));
++    // same worst case as ecpu below: an evicted layer puts every one of its experts on the CPU lane
++    CK(cudaHostAlloc((void**) &E.cpu_out, (E.kv_grow ? (size_t) std::max<int>(T * Kp, m.g.n_expert) : (size_t) T * Kp) * N * 4,
++                     cudaHostAllocDefault));
+     CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
+     CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
+     CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault));
+-    CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
++    // with --kv-grow a whole layer can be evicted mid-conversation, so the CPU lane may see every expert of a layer
++        const size_t ecpu_rows = E.kv_grow ? (size_t) std::max<int>(T * Kp, m.g.n_expert) : (size_t) T * Kp;
++        CK(cudaMalloc(&E.ecpu, ecpu_rows * N * 4));
+     CK(cudaMalloc(&E.d_miss, T * Kp * 4));
+     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
+     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
+@@ -3888,6 +4493,17 @@ struct Serve {
+             std::fflush(stdout);
+             return;
+         }
++        // --kv-grow: the KV may only be mapped up to its cap, so a request that needs more is refused here, while the
++        // engine is still healthy, rather than halfway through its prompt.
++        if (E.kv_grow && E.kv_grow_max_cells > 0 && (int64_t) ids.size() + max_new > E.kv_grow_max_cells) {
++            std::printf("ERR prompt (%zu tokens) + max_new (%lld) exceeds --kv-grow-max (%lld)\n",
++                        ids.size(), max_new, (long long) E.kv_grow_max_cells);
++            std::fflush(stdout);
++            return;
++        }
++        // --kv-grow: this request needs this much context and not a cell more, so give the rest of the KV back and
++        // put the expert slots it frees in the card again.  A short chat after a long one gets its speed back.
++        E.kv_trim((int64_t) ids.size() + max_new);
+         bool bad = false;
+         for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) E.m->g.n_vocab;
+         if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); return; }
+@@ -4125,6 +4741,11 @@ int strata::qwen35::run(int argc, char** argv) {
+     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
+     // the opt-ins of this engine path (docs/QWEN36.md): off, they leave the default path as it was
+     std::string kv = "fp32", tokens_file;
++    bool kv_grow = false;                 // --kv-grow: the KV maps pages only as far as the context reaches
++    int64_t kv_grow_window = 8192;        // --kv-grow-window N: the cells mapped at load
++    int64_t kv_grow_max = 0;
++    bool kv_grow_cli = false;   // --kv-grow was on the command line: it wins over the environment
++    size_t kv_grow_floor = (size_t) 256 << 20;              // --kv-grow-max N: the cells the context may reach
+     bool gqa_attn = false, attn_mma = false;
+     std::string dump_routing, expert_profile;
+     for (int i = 1; i < argc; ++i) {
+@@ -4172,6 +4793,13 @@ int strata::qwen35::run(int argc, char** argv) {
+         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
+         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
+         else if (a == "--kv") kv = next();   // strata's names (checked below): fp16, int8, k8v4; fp32 this path's default
++        else if (a == "--kv-grow") {   // the KV takes VRAM only as far as the context reaches (CUDA VMM)
++            kv_grow_cli = true;
++            const std::string v = next();
++            kv_grow = v != "off" && v != "0" && v != "false";
++        } else if (a == "--kv-grow-window") kv_grow_window = std::max<int64_t>(1, std::atoll(next().c_str()));
++        else if (a == "--kv-grow-max") kv_grow_max = std::max<int64_t>(0, std::atoll(next().c_str()));
++        else if (a == "--kv-grow-floor") kv_grow_floor = (size_t) std::max<int64_t>(0, std::atoll(next().c_str())) << 20;
+         else if (a == "--gqa-attn") gqa_attn = true;               // the grouped-query decode attention (fp32 / int8 cache)
+         else if (a == "--attn-mma") attn_mma = true;               // with --kv int8: its tensor-core kernel (sm_80+, not bit-identical)
+         else if (serve_mode && a.rfind("--", 0) == 0) {
+@@ -4257,6 +4885,15 @@ int strata::qwen35::run(int argc, char** argv) {
+     E.kv8 = kv8;
+     E.kv_f16 = kv_f16;
+     E.kv_v4 = kv_v4;
++    // HOST.cmd's "one card" mode sets this instead of a flag: setup.py builds the argument list, and an environment
++    // variable stays inside that process tree (nothing is written to the config).
++    if (!kv_grow_cli) {
++        if (const char* ev = std::getenv("STRATA_KV_GROW")) kv_grow = ev[0] != '0' && ev[0] != '\0';
++    }
++    E.kv_grow = kv_grow;
++    E.kv_grow_window = kv_grow_window;
++    E.kv_grow_max_cells = kv_grow_max;
++    E.kv_grow_floor = kv_grow_floor;
+     if ((kv_f16 || kv_v4) && m.g.n_head / m.g.n_head_kv > 8) {
+         std::fprintf(stderr, "strata-q36: --kv fp16 / k8v4 support at most 8 query heads per KV head\n"); return 2;
+     }
+@@ -4324,6 +4961,49 @@ int strata::qwen35::run(int argc, char** argv) {
+             std::fprintf(stderr, "strata-q36: chunk rule: free %.2f GiB (raw %.2f, with %.2f packed), main experts %.2f GiB, chunk %d\n",
+                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
+     }
++    const int ctx_asked = ctx;   // what the owner configured, before any rounding done for the KV layout
++    if (kv_grow) {
++        // A KV head spans ctx * cell bytes and the mapping works in granularity steps, so a head has to span a whole
++        // number of granules: 32768 cells x 288 B = 9,437,184 = 4.5 granules, and the per-head mapping then rounds a
++        // head's start into the previous head's tail until cuMemMap fails mid-conversation.  Round the CONTEXT (not the
++        // buffer - the attention kernels take a head's stride from ctx) to the nearest value that lines up.
++        int dev0 = 0;
++        (void) cudaGetDevice(&dev0);
++        const size_t g0 = kv_granularity(dev0);
++        const size_t cell_k = E.kv8 ? kv_cell_bytes((int) m.g.head_dim, true)
++                                    : (size_t) m.g.head_dim * (E.kv_f16 ? sizeof(__half) : sizeof(float));
++        const size_t cell_v = E.kv_v4 ? sizeof(q36attn::q4_cell) : cell_k;
++        const size_t step_k = g0 / std::gcd(cell_k, g0);
++        const size_t step_v = g0 / std::gcd(cell_v, g0);
++        const size_t step = step_k / std::gcd(step_k, step_v) * step_v;
++        if (step > 0 && (ctx % step) != 0) {
++            ctx = (int) (((size_t) ctx + step - 1) / step * step);
++            std::fprintf(stderr,
++                         "strata-q36: --kv-grow: a KV head has to span a whole number of %zu MiB granules, so the "
++                         "context is %d instead of %d (nearest value that works; the extra cells are only mapped if a "
++                         "conversation reaches them)\n",
++                         g0 >> 20, ctx, ctx_asked);
++        }
++        // The rounded context is the LAYOUT only.  A conversation must not grow past what the owner asked for, so
++        // without an explicit --kv-grow-max the cap is his original --max-context.
++        if (kv_grow_max == 0) {
++            kv_grow_max = ctx_asked;
++            E.kv_grow_max_cells = kv_grow_max;
++        }
++    }
++    if (kv_grow && batch > 1) {
++        // Several decoding sessions make the KV four times bigger (2 x 2.38 GiB at a 262144 context) and the engine then
++        // has no room to grow into: a request stalls after its first chunk, and the placement path that follows cannot
++        // be trusted either.  Turn the feature off before anything is sized for it - the model runs exactly as without.
++        // Silently turning the feature off is not enough: the same config then prefills ~10x slower than stock (69 vs
++        // 816 tok/s at 23k tokens), which is worse than a refusal because it looks like the model got slower.
++        std::fprintf(stderr,
++                     "strata-q36: --kv-grow: --batch %d asks for several decoding sessions, which --kv-grow does not "
++                     "support (the KV grows to four times its window and there is no room left for it).  Start the "
++                     "engine with either --batch 1 or without --kv-grow.\n", batch);
++        std::fflush(stderr);
++        std::exit(2);
++    }
+     E.init(m, ctx, chunk, batch, vision);
+     std::vector<std::vector<int>> prof_rank;
+     if (!expert_profile.empty()) {
+@@ -4333,6 +5013,7 @@ int strata::qwen35::run(int argc, char** argv) {
+             return 2;
+         }
+     }
++    E.kv_grow_plan(E.boot_others > 0);
+     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots,
+                        prof_rank.empty() ? nullptr : &prof_rank, err)) {
+         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
