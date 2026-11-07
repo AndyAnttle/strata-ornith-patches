@@ -13,7 +13,7 @@ One RTX 3090, Ornith-1.5-35B Q4_K_M, `--max-context 262144`:
 | 23,204 tokens | - | 1,235 tok/s |
 | 987 tokens after a long one | - | 1,192 tok/s |
 
-Enable with `--kv-grow on` (or `STRATA_KV_GROW=1` in the environment; HOST.cmd's one-card mode asks for it). Knobs:
+Enable with `--kv-grow on` (or `STRATA_KV_GROW=1` in the environment). Knobs:
 `--kv-grow-window` (cells mapped at load, default 8192), `--kv-grow-max` (how far the conversation may grow, defaults to
 `--max-context`) and `--kv-grow-floor` (VRAM left free: 256 MiB on a dedicated card, 4-5 GiB on the one that drives the
 desktop).
